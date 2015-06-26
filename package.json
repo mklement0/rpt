@@ -1,0 +1,52 @@
+{
+    "name": "rpt"
+  , "description": "Repeats text or random bytes a specifiable number of times supporting various units, typically for creation of test files."
+  , "private": false
+  , "version": "0.0.0"
+  , "os":
+    [
+        "linux"
+      , "darwin"
+    ]
+  , "preferGlobal": true
+  , "bin":
+    {
+        "rpt": "bin/rpt"
+    }
+  
+  , "homepage": "https://github.com/mklement0/rpt"
+  , "repository":
+    {
+        "type": "git"
+      , "url": "https://github.com/mklement0/rpt.git"
+    }
+  , "bugs":
+    {
+        "url": "https://github.com/mklement0/rpt/issues"
+    }
+  , "scripts":
+    {
+        "test": "make test"
+    }
+  , "keywords":
+    [
+        "repeat"
+      , "replicate"
+      , "test"
+      , "test files"
+      , "generate"
+      , "random"
+    ]
+  , "author": "Michael Klement <mklement0@gmail.com> (http://same2u.net)"
+  , "license": "MIT"
+  , "net_same2u": { "make_pkg": { "tocOn": true, "tocTitle": "**Contents**" } }
+  , "devDependencies":
+    {
+      "doctoc": "^0.13.0",
+      "json": "^9.0.3",
+      "replace": "^0.3.0",
+      "semver": "^4.2.0",
+      "tap": "^0.6.0",
+      "urchin": "^0.0.5"
+    }
+}

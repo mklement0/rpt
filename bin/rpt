@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+
+unset CDPATH
+
+kTHIS_NAME=$(basename "$BASH_SOURCE")
+
+# Helper function for exiting with error message due to runtime error.
+#   die [errMsg [exitCode]]
+# Default error message states context and indicates that execution is aborted. Default exit code is 1.
+# Prefix for context is always prepended.
+# Note: An error message is *always* printed; if you just want to exit with a specific code silently, use `exit n` directly.
+die() {
+  echo "$kTHIS_NAME: ERROR: ${1:-"ABORTING due to unexpected error."}" 1>&2
+  exit ${2:-1} # Note: If the argument is non-numeric, the shell prints a warning and uses exit code 255.
+}
+
+# Helper function for exiting with error message due to invalid parameters.
+#   dieSyntax [errMsg]
+# Default error message is provided, as is prefix and suffix; exit code is always 2.
+dieSyntax() {
+  echo "$kTHIS_NAME: ARGUMENT ERROR: ${1:-"Invalid argument(s) specified."} Use -h for help." 1>&2
+  exit 2
+}
+
+# Recognized scale (multiplier, factor) suffixes
+kSCALE_SUFFIXES=(    k     m       g             ki    mi      gi  )
+kMULTIPLIERS=(       1000  1000000 1000000000    1024 1048576  1073741824 )
+
+kDEFAULT_NUMBERED_LINES_FORMAT='line %.0f'
+
+# Output version number and exit, if requested. Note that the `ver='...'` statement is automatically updated by `make version VER=<newVer>` - DO keep the 'v' suffix in the variable *definition*.
+[[ $1 == '--version' ]] && { ver='v0.0.0'; echo "${ver#v}"; exit 0; }
+
+# Command-line help.
+if [[ "$1" == '--help' || "$1" == '-h' ]]; then
+  cat <<EOF
+
+SYNOPSIS
+  $kTHIS_NAME [-c] -r count
+  $kTHIS_NAME [-c] -n [fmtText]
+  $kTHIS_NAME [-c] count[b][,[lineRepeatCount]] [text...]
+
+DESCRIPTION
+  Repeats text or random bytes or numbered lines a specifiable number of times
+  or until a target byte count is reached, typically to create test data.
+  Output is sent to stdout.
+
+  <count>, irrespective of any unit suffix, can be scaled with a
+  *scale suffix*:
+      ${kSCALE_SUFFIXES[*]}
+    representing the following multipliers ('i' denotes binary ones):
+      ${kMULTIPLIERS[*]}
+  E.g., '2k' represents 2,000, '1gi' represents 1,073,741,824 (1024^3).
+  With a scale suffix, you may optionally specify the count as a float; e.g.,
+  '.5k' for 500, or '1.5mi' for 1,572,864 (1.5 * 1024^2).
+  Be careful with large multipliers, as the resulting data can take
+  a long time to produce. Creating random data (-r) is fastest.
+
+  -c (all synopsis forms)
+    count-only: only outputs the total number of bytes that *would* be 
+    generated, without actually generating data.
+    The number is output as an unscaled integer.
+    Also useful for measuring the (total) byte length of TEXT containing
+    multi-byte characters.
+
+  1st synopsis form: outputs random bytes:
+    With -r, <count> invariably specifies the number of random *bytes* to
+    output, generated via /dev/urandom. Note that the output may include
+    non-printable chars., including NUL.
+
+  2nd synopsis form: outputs numbered lines:
+
+    Note: This form relies on the presence of the \`seq\` utility, and the 
+    output lines are numbered sequentially, starting with 1.
+
+    -n ... outputs <countLines> sequentially numbered lines.
+      If <fmtText> is not specified, the default is '$kDEFAULT_NUMBERED_LINES_FORMAT',
+      resulting in 'line 1', 'line 2', ...
+      <fmtText> is a constrained printf-style format string for use by \`seq\`,
+      which may contain arbitrary text combined with exactly one format
+      specifier for the line number, using one of the following:
+      %E, %e, %f, %G, %g
+      To avoid switching to exponential notation with numbers >= 1,000,000, 
+      use '%.0f'. As with `\printf\`, you may specify a fixed field width, with
+      either left-space padding (e.g., `%4.0f`) or left-zero-padding
+      (e.g., `%04.0f`).
+
+  3rd synopsis form: outputs instances of the specified text:
+
+    If <text> is not given, input is read from stdin.
+  
+    In addition to the scale suffix described above, the following *unit
+    suffixes* may be specified:
+      (none) ...  by default, specifies the count of multiples of the input to
+        create, whatever its length.
+      b ... the total number of *bytes* to output
+        Note that the exact byte count is enforced, meaning that multiples of
+        the input are cut off as needed, possibly even inside a multi-byte
+        character.
+      ,[lineRepeatCount] ... places each replicated instance of the input on
+        its own output line, optionally <lineRepeatCount> times, if specified.
+
+EXAMPLES
+  $kTHIS_NAME 3 x         # -> 'xxx'
+  $kTHIS_NAME 3, 'ab'     # -> $'ab\nab\nab\n'
+  $kTHIS_NAME 10,80 x     # -> 10 lines with 80 'x' chars. each
+  $kTHIS_NAME 1kb,80 x > out # create 1000-byte file 'out' filled 
+                             # with lines of 80 'x' chars. each
+  $kTHIS_NAME -r .5ki > out # create file 'out' with 512 random bytes
+  $kTHIS_NAME -r 1m > out   # create file 'out' with 10^6 random bytes
+  $kTHIS_NAME -c 1 'Hï'     # -> 3: the number of bytes in the string (UTF8)
+EOF
+    exit 0
+fi
+
+
+# SYNOPSIS
+#   repeat [-b|-B] [-s sep] [-d delim] [-t trm] count [text...]
+# DESCRIPTION
+#   Repeats (replicates) string <text> <count> times. NO \n is appended to the output.
+#   If <text> is not specified, its value is read from stdin.
+#     -b (default) / -B
+#        Makes / does NOT make <text>, <sep>, <delim>, and <trm> *subject to interpretation of backslash escape sequences* (e.g., '\n')
+#     -s sep (default: empty)
+#       Specifies a separator string to place *between* instances of <text>.
+#     -d delimiter (default: empty)
+#       Specifies a delimiter string to place *around* instances of <text>.
+#       If <delimiter> is a single char., that char is used as both the opening and closing delimiter.
+#       Otherwise, the first half of <delimiter> is used as the opening one, and the 2nd half as the closing one.
+#     -t trm (default: empty)
+#       Specifies a terminator string to place *after* every instance of <text>, including the last one.
+# IMPLEMENTATION NOTES
+#   Uses perl, if available, awk otherwise.
+# EXAMPLES
+#      repeat 3 'x' # -> 'xxx' 
+#      repeat -s @ 5 'x' # -> 'x@x@x' 
+#      repeat -b 3 'line\n' - # -> $'line\nline\nline\n' (3 lines)
+#      repeat -B -s ' ' 3 'a\b' - # -> 'a\b a\b \ab' 
+#      repeat -s ' ' -d '[]' 3 'a' - # -> '[a] [a] [a]' 
+repeat() {
+  local OPTARG= OPTIND=1 opt interpret sep delimOpen delimClose trm count fmt txtRaw txt txtUnit
+  interpret=1 sep= delimOpen= delimClose= trm= # defaults
+  while getopts ':bBs:t:d:' opt; do
+    [[ $opt == '?' ]] && { echo "ARGUMENT ERROR: Unknown option: -$OPTARG" >&2; return 2; }
+    [[ $opt == ':' ]] && { echo "ARGUMENT ERROR: Option -$OPTARG is missing its argument." >&2; return 2; }
+    case "$opt" in
+      b)
+        interpret=1
+        ;;
+      B)
+        interpret=0
+        ;;
+      s)
+        sep=$OPTARG
+        ;;
+      d)
+        if (( ${#OPTARG} == 1 )); then
+          delimOpen=$OPTARG
+          delimClose=$delimOpen
+        else
+          delimOpen=${OPTARG: 0: ${#OPTARG} / 2}
+          delimClose=${OPTARG: ${#delimOpen}}
+        fi
+        ;;
+      t)
+        trm=$OPTARG
+        ;;
+      *)
+        { echo "DESIGN ERROR: option -$opt not handled." >&2; return 3; }
+        ;;
+    esac
+  done
+  shift $((OPTIND - 1)) # Skip the already-processed arguments (options).
+
+  # Validate the count and convert it to a decimal.
+  count=$(set -u; echo $(( $1 ))) >/dev/null # Sadly, Bash's error message in the event that the input is not a number cannot be suppressed.
+  [[ -n $count ]] && (( count >= 0 )) || { echo "ARGUMENT ERROR: '$1' is not a valid repeat count. Please specify an integer >= 0 in either decimal, hex, or octal form." >&2; return 2; }
+  shift
+
+  if (( $# == 0 )); then # read from stdin - all input at once.
+    IFS= read -d $'\x4' -r txtRaw
+  else # all remaining operands (though typically only 1)
+    txtRaw=$*
+  fi
+
+  # Determine the printf format to apply, depending on whether backslash escape sequences should be interpreted or not.
+  (( interpret )) && fmt='%b' || fmt='%s'
+
+  # Determine the dressed-up unit of text to replicate.
+  txtUnit="${delimOpen}${txtRaw}${delimClose}${trm}" # delimiters and terminator applied - but NOT the separator
+  # With a separatore specified, we append it to the unit, but only print count *minus 1* instances,
+  # so that we can print the final instance without separator afterward.
+  [[ -n $sep ]] && { txt=${txtUnit}${sep}; (( --count )); } || txt=$txtUnit
+
+  if (( count )); then
+    if [[ -n $(command -v perl) ]]; then # use Perl, if available: it's faster with high repeat counts.
+      # echo "[??perl]"
+      # Note that we must pass the count as an ad-hoc *environment* variable, since we're using -n
+      # to pass the (interpreted) text as a file (we pass the text via stdin, because using
+      # a variable that captures the output from printf using a command substitition would eat trailing newlines).
+      # !! For FreeBSD compatibility we avoid process substitution.
+      printf "$fmt" "$txt" | count=$count perl -0777 -ne 'print $_ x $ENV{count};'
+    else # otherwise: use awk: still reasonably fast, but perl is much faster esp. with high repeat counts.
+      # echo "[??awk]"
+      # Note that we pass the text as a *file* rather than with `-v var=value`, because that
+      # way we can pass multi-line strings and control if and when backslash interpretation occurs.
+      # (Such interpretation is *invariably* applied to `-v var=...` values.)
+      # !! For FreeBSD compatibility we avoid process substitution.
+      # !! Do NOT use `NF=101`, because it crashes BSD awk.
+      printf "$fmt" "$txt" | awk -v count=$(( count + 1 )) -v RS=$'\3' -v ORS=  'BEGIN { getline OFS; $count=""; print }'
+    fi
+  fi
+
+  [[ -n $sep ]] && (( count >= 0 )) && printf "$fmt" "$txtUnit" # print last instance without trailing separator
+
+}
+
+
+# SYNOPSIS
+#   repeat_singleByte count single-byte-char
+# DESCRIPTION
+#   If Perl is not available, this is a more efficient alternative to repeat() for a given single byte.
+# IMPLEMENTATION NOTES
+#   Uses Perl, if available, head -c otherwise. Perl is much faster.
+#   E.g.: Creating 10^9 bytes (1 metric GB) on a 3.2 Ghz machine takes about 3.5 secs with perl, almost 2 minutes(!) with head -c + tr (and around 6 minutes with awk).
+repeat_singleByte() {
+  if [[ -f $(command -v perl1) ]]; then # use perl, if available: it's much faster with high repeat counts.
+      perl -e 'print $ARGV[1] x $ARGV[0];' "$1" "$2"
+  else # otherwise, use head -c + tr, which is (a) much slower, and (b), not POSIX-compliant (while POSIX tail has a -c option for bytes, head does not).
+    ## use dd (as POSIX utility), which is much slower, however.
+    # # !! `dd` accepts a maximum of 2147483647 as the block size, so we need to *chunk* the output accordingly.
+    # local passes=$(( $1 / 2147483647 )) rest=$(( $1 % 2147483647 )) thisPassByteCount i
+    # for (( i = 0; i <= $passes; i++ )); do
+    #   (( i == passes )) && thisPassByteCount=$rest || thisPassByteCount=2147483647
+    #   dd if=/dev/zero bs=$thisPassByteCount count=1 2>/dev/null | tr '\0' "$2" || return
+    # done
+    head -c "$1" /dev/zero | tr '\0' "$2"
+  fi
+}
+
+# Outputs the specified number of random bytes.
+repeat_randomBytes() {
+  # # !! `dd` accepts a maximum of 2147483647 as the block size, so we need to *chunk* the output accordingly.
+  # local passes=$(( $1 / 2147483647 )) rest=$(( $1 % 2147483647 )) thisPassByteCount i
+  # for (( i = 0; i <= $passes; i++ )); do
+  #   (( i == passes )) && thisPassByteCount=$rest || thisPassByteCount=2147483647
+  #   dd if=/dev/urandom bs=$thisPassByteCount count=1 2>/dev/null || return
+  # done
+  head -c "$count" /dev/urandom
+}
+
+# Converts all arguments to *decimal integers* (i.e.: strings representing the input number with base 10), if possible, and outputs one number per line.
+# By default, positive and negative integers are accepted, but when invoked by a function named 'toPosInt', only positive (>= 0) integers are accepted.
+# Acceptable number formats are: DECIMAL, HEX (PREFIX '0x' OR '0X'), OCTAL (PREFIX '0') - LEADING AND TRAILING WHITESPACE IS IGNORED.
+# Exit code is 0 if ALL arguments were recognized as numbers of the expected type, 1 otherwise - processing stops with the first argument that's not a number.
+# Examples:
+#   n=$(toInt $1) || echo "$1 is not an integer."
+#   toInt 0x10 010 -77 # -> $'16\n8\n-77'
+# See also: isInt()
+toInt() {
+  local nRaw n positiveOrZeroOnly=0 basePrefix digits
+  [[ ${FUNCNAME[1]} == 'toPosInt' ]] && positiveOrZeroOnly=1
+  (( $# )) || return 1  # no input -> not an integer
+  for nRaw in "$@"; do
+    # !! Sadly, blindly trying to convert with $(( ... )) results in *instant return with error code 1 and an error message that cannot be suppressed* for numbers with invalid bases such as '08'.
+    # !! Conversely, a non-number - such as whitespace or text that could be a variable name - silently results in output '0'.
+    # !! (We could use `set -u` in a subshell to trigger errors in case of undefined variables, but there could still be accidental matches with currently defined shell variables.)
+    # !! Thus, we try to weed out non-numbers or invalid numbers with a regex first, but limit ourselves to the most frequently used number bases: decimal, octal, hex.
+    # We accept, in order:
+    #   optional: leading whitespace
+    #   optional: either + or - sign
+    #   optional: base prefix:
+    #      0 ... octal
+    #      0x or 0X .. hex
+    #   mandatory: at least 1 digit
+    #   optional: trailing whitespace
+    [[ $nRaw  =~ ^[[:space:]]*[-+]?(0[xX]?)?([0-9A-Fa-f]+)[[:space:]]*$ ]] || return 1
+    basePrefix=${BASH_REMATCH[1]} digits=${BASH_REMATCH[2]}
+    case "$basePrefix" in
+      0x|0X) # hex
+        : # already validated by the regex above
+        ;;
+      0) # octal
+        [[ $digits =~ ^[0-7]+$ ]] || return 1
+        ;;
+      *) # decimal
+        [[ $digits =~ ^[0-9]+$ ]] || return 1
+        ;;  
+    esac
+    # At this point we can confidently convert to a decimal using $(( ... )).
+    n=$(( nRaw )) || return 1
+    # If requested, ensure that the number is >= 0.
+    (( positiveOrZeroOnly && n < 0 )) && return 1
+    echo "$n"
+  done
+  return 0
+}
+
+
+# Converts all arguments to *positive (>=0) decimal integers* (i.e.: strings representing the input number with base 10), if possible, and outputs one number per line.
+# See toInt() for details.
+# Example:
+#   n=$(toPosInt $1) || echo "$1 is not a positive integer."
+toPosInt() { toInt "$@"; } # !! NO extra arg needed; toInt() modifies its behavior based on the name of the invoking function.
+
+
+# SYNOPSIS
+#     indexOf needle "${haystack[@]}"
+# *Via stdout*, returns the zero-based index of a string element in an array of strings or -1, if not found.
+# The *return code* indicates if the element was found or not.
+# EXAMPLE
+#   a=('one' 'two' 'three')
+#   ndx=$(indexOf 'two' "${a[@]}") # -> $ndx is now 1
+indexOf() {
+  local e ndx=-1
+  for e in "${@:2}"; do (( ++ndx )); [[ "$e" == "$1" ]] && echo $ndx && return 0; done
+  echo '-1'; return 1
+}
+
+# -------------------------
+
+# Parse options.
+countIsTotalSize=0
+randomBytes=0
+countOnly=0
+sep=
+numberedLines=0
+numberedLinesFormat=$kDEFAULT_NUMBERED_LINES_FORMAT
+while getopts ':rcnf:' opt; do
+  [[ $opt == '?' ]] && dieSyntax "Unknown option: -$OPTARG"
+  [[ $opt == ':' ]] && dieSyntax "Option -$OPTARG is missing its argument."  
+  case "$opt" in
+    # l)
+    #   sep='\n'
+    #   ;;
+    # t)
+    #   countIsTotalSize=1
+    #   ;;
+    r)
+      randomBytes=1
+      ;;
+    c)
+      countOnly=1
+      ;;
+    n)
+      numberedLines=1
+      ;;
+    *)
+      die "DESIGN ERROR: option -$opt not handled."
+      ;;
+  esac
+done
+shift $((OPTIND - 1)) # Skip the already-processed arguments (options).
+
+countRaw=$1; shift # Note: the count is validated below.
+# Make sure that at least a count was specified.
+[[ -n $countRaw ]] || dieSyntax "Too few arguments specified."
+
+# Check for incompatible arguments - more checks below.
+(( randomBytes && $# > 0 )) && dieSyntax "Incompatible arguments specified."
+
+# ===== Perform the following case-INsensitively.
+countIsTotalSize=0 lineBasedOutput=0 perLineRepeatCount=1
+mustReset=$(shopt -q nocasematch; echo $?); shopt -s nocasematch
+
+  # Split count into number and suffixes, if any (scale, unit, per-line repeat count).
+  suffix=
+  suffixChars=$(IFS=''; echo "${kSCALE_SUFFIXES[*]}")
+  reSuffixes=$(IFS='|'; echo "${kSCALE_SUFFIXES[*]}")
+
+  if [[ $countRaw =~ ^([^,b$suffixChars]+)(${reSuffixes})?(b)?(,.*)?$ ]]; then
+
+    countRaw=${BASH_REMATCH[1]}; scale=${BASH_REMATCH[2]}; unit=${BASH_REMATCH[3]}; perLineSpec=${BASH_REMATCH[4]}
+
+    # Validate the per-line spec, if specified.
+    if [[ -n $perLineSpec ]]; then
+        (( ! (randomBytes || numberedLines) )) || dieSyntax "Incompatible arguments specified."
+        lineBasedOutput=1
+        if (( ${#perLineSpec} > 1 )); then
+            perLineRepeatCount=$(toPosInt "${perLineSpec:1}") || dieSyntax "'${perLineSpec:1}' is not a positive integer."
+        fi
+    fi
+
+    # pv countRaw scale unit perLineSpec # ??
+
+    [[ $unit == 'b' ]] && countIsTotalSize=1
+
+    # Look up multiplier by scale, if specified
+    multiplier=1
+    if [[ -n $scale ]]; then
+      multiplierNdx=$(indexOf "$scale" "${kSCALE_SUFFIXES[@]}")
+      multiplier=${kMULTIPLIERS[multiplierNdx]}
+    fi
+
+    # Validate the number part:
+    # First, see if it's an integer (and convert to decimal format):
+    haveInt=0
+    count=$(toPosInt "$countRaw") && haveInt=1
+    if (( haveInt )); then # an integer
+      # Apply the multiplier.
+      (( count *= multiplier ))
+    else # either a float or an invalid number
+
+      # We only accept floats with multipliers > 1.
+      (( multiplier > 1 )) || dieSyntax "'$countRaw' is not a positive integer."
+
+      errMsg="'$countRaw' is not a positive integer or decimal fraction."
+
+      # Crude test: float must start with digit or '.'
+      [[ $countRaw =~ ^[0-9.] ]] || dieSyntax "$errMsg"
+
+      # Apply the multiplier, implicitly validating the number as a float.
+      # !! Sadly, bc never sets a nonzero exit code, ignores all-letter tokens silently, but at least outputs '[...] parse error' to stderr for mixed digit-letter tokens such as '1a'.
+      count=$(bc <<<"$countRaw * $multiplier" 2>&1)
+      [[  $count =~ 'error' ]] && dieSyntax "$errMsg"
+      
+      # Simply round down to nearest integer (lop off everything starting with the decimal point).
+      count=${count%.*}
+          
+    fi
+
+  else # No known suffix detected - we require an INTEGER.
+
+    # Validate the number.
+    count=$(toPosInt "$countRaw") || dieSyntax "'$countRaw' is not a positive integer or has unknown suffix."
+
+  fi
+
+(( mustReset )) && shopt -u nocasematch
+# ======
+
+# Produce the requested data.
+# PERFORMANCE NOTES:
+#  Due to our implementation, RANDOM data is the FASTEST to produce, with the single-byte data and multi-byte/char data taking about twice as long.
+#  Example timings from a late 2012 iMac:
+# $ time rpt -r 1.5gi >out1  # RANDOM
+#   real  1m53.387s
+#   user  0m0.008s
+#   sys 1m45.002s
+# $ time rpt 1.5gi >out2  # SINGLE-BYTE
+#   real  3m1.468s
+#   user  2m57.457s
+#   sys 0m4.273s
+# $ time rpt -lt 1.5gi "$(rpt -t 79 'abc ')" >out3  # MULTI-BYTE/CHAR
+#   real  3m22.747s
+#   user  2m48.765s
+#   sys 0m34.479s
+
+# Edge case: Exit, if count is 0, possibly preced by printing "0", if -c was specified.
+if (( count == 0 )); then
+  (( countOnly )) && echo "$count"
+  exit 0  # Nothing to do.
+fi
+
+if (( randomBytes )); then  # RANDOM bytes
+
+  # DRY RUN: only print the total count of bytes that *would* be generated and exit.
+  if (( countOnly )); then
+    echo "$count"
+    exit 0
+  fi
+
+  # Output as many random bytes as requested.
+  repeat_randomBytes $count || die
+
+elif (( numberedLines )); then
+
+  [[ -n $(command -v seq) ]] || die "Required utility \`seq\` not found."
+
+  # Determine the format string.
+  txt=$*
+  txt=${txt:-$kDEFAULT_NUMBERED_LINES_FORMAT}
+
+  cmdArgs=( seq -f "$txt" $count )
+
+  if (( countOnly )); then
+    if (( ! countIsTotalSize )); then
+      # !! If only a line count was given, we must actually execute the 
+      # !! command to see how many bytes it results in.
+      count=$(( $("${cmdArgs[@]}" | wc -c) )) # the extra $(( ... )) is to trim the leading whitespace that BSD wc outputs.
+      (( ${PIPESTATUS[0]} == 0 )) || die
+    fi
+    echo "$count"
+    exit 0
+  fi
+
+  if (( countIsTotalSize )); then
+    "${cmdArgs[@]}" | head -c $count
+    # Make sure that head succeeded, and that seq either reported success
+    # or 141 (128 + 13 (SIGPIPE)), which happens when head exits after having
+    # received enough data.
+    (( $? == 0 && (${PIPESTATUS[0]} == 0 || ${PIPESTATUS[0]} == 141) )) || die
+  else
+    "${cmdArgs[@]}" || die
+  fi
+
+else # specified text
+  
+  # Determine the text to repeat
+  if (( $# == 0 )); then # read from stdin - all input at once.
+    IFS= read -d $'\x4' -r txt
+  else # all remaining operands (though typically only 1)
+    txt=$*
+  fi
+
+  # Apply per-line repeat count, if specified
+  if (( lineBasedOutput )); then
+    case $perLineRepeatCount in
+      0)
+        txt=
+        ;;
+      1)
+        : # nothing more to do
+        ;;
+      *)
+        txt=$(repeat -- $perLineRepeatCount "$txt")
+        ;;
+    esac
+    txt+=$'\n'
+  fi
+
+  txtLenInBytes=$(printf '%b' "$txt" | wc -c) # Note the use of %b to ensure that escape sequences in $txt are expanded.
+
+  # DRY RUN: only print the total count of bytes that *would* be generated and exit.
+  if (( countOnly )); then
+    if (( countIsTotalSize )); then
+      echo "$count"
+    else
+      echo "$(( count * txtLenInBytes ))"
+    fi
+    exit 0
+  fi
+
+  # Invoke the implementing function - choose the most efficient one:
+
+  if (( txtLenInBytes == 1 )); then # SINGLE BYTE to repeat - for speed, use **Perl**, if available, else **dd**.
+  
+    repeat_singleByte $count "$txt" || die
+  
+  else # MORE THAN 1 BYTE/CHAR TO REPEAT AND/OR A SEPARATOR WAS SPECIFIED -> use **Perl**, if available, else **awk**.
+
+    # If the total byte count was specified, calculate how many repeats are needed, plus the rest.
+    remainingBytes=''
+    if (( countIsTotalSize )); then
+      totalCount=$count
+      count=$(( totalCount / txtLenInBytes ))
+      remainingByteCount=$(( totalCount % txtLenInBytes ))
+      # Determine the remaining text chunk needed to achieve the exact total byte count.
+      if (( remainingByteCount > 0 )); then
+         # !! Achieving the *exact* overall byte count is important, so we slice off the required number of *bytes*, 
+         # !! even though that can result in a multibyte char. at the very end getting broken apart, resulting
+         # !! in an illegal character.
+         # !! Figuring out if and when that happens would be nontrivial.
+         # !! Since we need to lop off *bytes*, we must switch to the "C" locale (in a subshell) first.)
+        remainingBytes=$(LC_ALL=C; printf %s "${txt:0:remainingByteCount}")
+      fi
+    fi
+
+    (( count > 0 )) && repeat -- $count "$txt"
+    [[ -n $remainingBytes ]] && printf "$remainingBytes"
+
+  fi
+
+fi
