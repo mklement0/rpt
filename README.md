@@ -1,4 +1,7 @@
-[![npm version](https://img.shields.io/npm/v/rpt.svg)](https://npmjs.com/package/rpt) [![license](https://img.shields.io/npm/l/rpt.svg)](https://github.com/mklement0/rpt/blob/master/LICENSE.md)
+![project status](https://img.shields.io/badge/status-not_ready_for_release-red.svg)
+
+<!-- [![npm version](https://img.shields.io/npm/v/rpt.svg)](https://npmjs.com/package/rpt) [![license](https://img.shields.io/npm/l/rpt.svg)](https://github.com/mklement0/rpt/blob/master/LICENSE.md)
+ -->
 
 <!-- START doctoc -->
 <!-- END doctoc -->
