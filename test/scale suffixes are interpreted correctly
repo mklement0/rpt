@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+# ---
+# IMPORTANT: Use the following statement at the TOP OF EVERY TEST SCRIPT
+#            to ensure that this package's 'bin/' subfolder is added to the path so that
+#            this package's CLIs can be invoked by their mere filename in the rest
+#            of the script.
+# ---
+PATH=${PWD%%/test*}/bin:$PATH
+
+# Helper function for error reporting.
+die() { (( $# > 0 )) && echo "ERROR: $*" >&2; exit 1; }
+
+runTest() {
+  local msg=$1; shift
+  local expected=$1; shift
+  local actual=$( "$@" )
+  [[ "$actual" == "$expected" ]] || die "$msg: expected '$expected', got '$actual'"
+}
+
+# Define scale suffixes and their respective multipliers.
+scaleSuffixes=( ''    k       m          g   ki      mi         gi )
+multipliers=(    1 1000 1000000 1000000000 1024 1048576 1073741824 )
+
+# Positive test: make sure all scale suffixes are recognized correctly.
+i=0
+for scaleOuter in "${scaleSuffixes[@]}"; do
+  multiplier=${multipliers[i++]}
+  # Try with both lower- and uppercase versions.
+  for scale in "$scaleOuter" "$(tr '[:lower:]' '[:upper:]' <<<"$scaleOuter")"; do
+    # -- no units
+    runTest "scale suffix '$scale', no units" "$(( 3 * multiplier ))" rpt -c "3$scale" .
+    runTest "scale suffix '$scale', no units, line-based" "$(( 3 * 2 * multiplier ))" rpt -c "3${scale}",1 .
+    # -- with units
+    runTest "scale suffix '$scale', unit 'b'" "$(( 3 * multiplier ))" rpt -c "3${scale}"b .
+    runTest "scale suffix '$scale', unit 'b', line-based" "$(( 3 * multiplier ))" rpt -c "3${scale}"b,1 .
+  done
+done
+
+# Negative test: make sure that scale suffixes are NOT recognized in per-line count specs.
+i=0
+for scaleOuter in "${scaleSuffixes[@]}"; do
+  multiplier=${multipliers[i++]}
+  [[ -z $scaleOuter || $scaleOuter == [mM] ]] && continue
+  for scale in "$scaleOuter" "$(tr '[:lower:]' '[:upper:]' <<<"$scaleOuter")"; do
+    rpt -c 1,"2${scale}" . && die "Scale suffix '$scale' unexpectedly accepted in per-line count spec."
+  done
+done
+
+exit 0

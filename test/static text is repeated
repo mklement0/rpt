@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+# ---
+# IMPORTANT: Use the following statement at the TOP OF EVERY TEST SCRIPT
+#            to ensure that this package's 'bin/' subfolder is added to the path so that
+#            this package's CLIs can be invoked by their mere filename in the rest
+#            of the script.
+# ---
+PATH=${PWD%%/test*}/bin:$PATH
+
+# Helper function for error reporting.
+die() { (( $# > 0 )) && echo "ERROR: $*" >&2; exit 1; }
+
+diff <(rpt 3 a; printf '\n') - <<'EOF' || die "primary-count-only, single-byte: unexpected output"
+aaa
+EOF
+
+diff <(rpt ,3 a) - <<'EOF' || die "line-based, single-line, single-byte: unexpected output"
+aaa
+EOF
+
+# --
+
+diff <(rpt 3 ab; printf '\n') - <<'EOF' || die "primary-count only, multi-byte/char: unexpected output"
+ababab
+EOF
+
+diff <(rpt ,3 ab) - <<'EOF' || die "line-based, single-line, mulit-byte/char: unexpected output"
+ababab
+EOF
+
+# --
+
+diff <(rpt 2,3 a) - <<'EOF' || die "line-based, multi-line: unexpected output"
+aaa
+aaa
+EOF
+
+# --
+
+diff <(rpt -s @ 2 a; printf '\n') - <<'EOF' || die "primary-only, sep: unexpected output"
+a@a
+EOF
+
+diff <(rpt -d @ 2 a; printf '\n') - <<'EOF' || die "primary-only, single-char delim: unexpected output"
+@a@@a@
+EOF
+
+diff <(rpt -d '[]' 2 a; printf '\n') - <<'EOF' || die "primary-only, multi-char delim: unexpected output"
+[a][a]
+EOF
+
+diff <(rpt -t@ 2 a; printf '\n') - <<'EOF' || die "primary-only, term: unexpected output"
+a@a@
+EOF
+
+diff <(rpt -s @ -t . 2 a; printf '\n') - <<'EOF' || die "primary-only, sep + term: unexpected output"
+a.@a.
+EOF
+
+diff <(rpt -s @ -d '[]' 2 a; printf '\n') - <<'EOF' || die "primary-only, sep + delim: unexpected output"
+[a]@[a]
+EOF
+
+diff <(rpt -d '[]' -t . 2 a; printf '\n') - <<'EOF' || die "primary-only, delim + term: unexpected output"
+[a].[a].
+EOF
+
+diff <(rpt -s @ -d '[]' -t . 2 a; printf '\n') - <<'EOF' || die "primary-only, sep + delim + term: unexpected output"
+[a].@[a].
+EOF
+
+
+# --
+
+diff <(rpt -s @ 2,3 a) - <<'EOF' || die "line-based, multi-line, sep: unexpected output"
+a@a@a
+a@a@a
+EOF
+
+diff <(rpt -d '"' 2,3 a) - <<'EOF' || die "line-based, multi-line, single-char delim: unexpected output"
+"a""a""a"
+"a""a""a"
+EOF
+
+diff <(rpt -d '[]' 2,3 a) - <<'EOF' || die "line-based, multi-line, multi-char delim: unexpected output"
+[a][a][a]
+[a][a][a]
+EOF
+
+diff <(rpt -t @ 2,3 a) - <<'EOF' || die "line-based, multi-line, term: unexpected output"
+a@a@a@
+a@a@a@
+EOF
+
+diff <(rpt -s @ -t . 2,3 a) - <<'EOF' || die "line-based, multi-line + term: unexpected output"
+a.@a.@a.
+a.@a.@a.
+EOF
+
+diff <(rpt -s @ -d '[]' 2,3 a) - <<'EOF' || die "line-based, multi-line + delim: unexpected output"
+[a]@[a]@[a]
+[a]@[a]@[a]
+EOF
+
+diff <(rpt -d '[]' -t . 2,3 a) - <<'EOF' || die "line-based, multi-line, delim + term: unexpected output"
+[a].[a].[a].
+[a].[a].[a].
+EOF
+
+diff <(rpt -s @ -d '[]' -t . 2,3 a) - <<'EOF' || die "line-based, multi-line + delim + term: unexpected output"
+[a].@[a].@[a].
+[a].@[a].@[a].
+EOF
+

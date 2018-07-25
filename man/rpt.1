@@ -1,0 +1,114 @@
+.TH "RPT" "1" "September 2015" "v0.0.0" ""
+.SH "NAME"
+\fBrpt\fR \- repeat text, numbered lines, random lines or bytes
+.SH SYNOPSIS
+.P
+Repeat static TEXT:
+.P
+.RS 2
+.nf
+rpt [<fmtOpts>] <count>[c|f][,[<perLineCount>[c|f]]] [<text>]
+
+<fmtOpts> control per\-line formatting:
+
+\-s <sep>     separator to place between units
+\-t <term>    terminator to place after every unit
+\-d <delims>  delimiters around each unit
+.fi
+.RE
+.P
+Generate NUMBERED LINES:
+.P
+.RS 2
+.nf
+rpt \-n        <lineOrCharCount>[c|f] [<fmtText>]
+.fi
+.RE
+.P
+Output RANDOM LINES from a file:
+.P
+.RS 2
+.nf
+rpt \-l        <lineOrCharCount>[c|f] <file>
+.fi
+.RE
+.P
+Generate RANDOM WORDS:
+.P
+.RS 2
+.nf
+rpt \-w        <count>[c|f][,[<perLineCount>[c|f]]] [<dictFile>]
+.fi
+.RE
+.P
+Generate RANDOM BYTES:
+.P
+.RS 2
+.nf
+rpt \-b        <byteCount>
+.fi
+.RE
+.P
+Shared count specifications:
+.P
+.RS 2
+.nf
+Counts may be scaled with multipliers (e\.g\., `2m`):
+Decimal:
+  k     m       g      
+    1000  10^6    10^9
+Binary:
+  ki    mi      gi
+    1024  1048576 1073741824
+
+\|'x' in lieu of a number outputs endlessly\.
+
+By default, counts specify how often to repeat the input or, for
+line\-based output, the number of output lines;
+a terminal 'c' or 'f' switches to character count:
+  'c'    at most as many chars\. as specified, no truncation
+  'f'    exactly as many chars\. as specified, may truncate
+.fi
+.RE
+.SH DESCRIPTION
+.SH OPTIONS
+.RS 0
+.IP \(bu 2
+\fB\-q\fP, \fB\-\-quiet\fP
+.br
+quiet mode
+
+.RE
+.SH STANDARD OPTIONS
+.P
+All standard options provide information only\.
+.RS 0
+.IP \(bu 2
+\fB\-h, \-\-help\fP
+.br
+Prints the contents of the synopsis chapter to stdout for quick reference\.
+.IP \(bu 2
+\fB\-\-man\fP
+.br
+Displays this manual page, which is a helpful alternative to using \fBman\fP,
+.br
+if the manual page isn't installed\.
+.IP \(bu 2
+\fB\-\-version\fP
+.br
+Prints version information\.
+.IP \(bu 2
+\fB\-\-home\fP
+.br
+Opens this utility's home page in the system's default web browser\.
+
+.RE
+.SH COMPATIBILITY
+.P
+Requires Perl v??? or higher\.
+.SH LICENSE
+.P
+Copyright (c) 2015 Michael Klement (mklement0@gmail\.com), released under
+.br
+the MIT license \fIhttps://spdx\.org/licenses/MIT\fR\|\.
+

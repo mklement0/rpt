@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+# ---
+# IMPORTANT: Use the following statement at the TOP OF EVERY TEST SCRIPT
+#            to ensure that this package's 'bin/' subfolder is added to the path so that
+#            this package's CLIs can be invoked by their mere filename in the rest
+#            of the script.
+# ---
+PATH=${PWD%%/test*}/bin:$PATH
+
+# Helper function for error reporting.
+die() { (( $# > 0 )) && echo "ERROR: $*" >&2; exit 1; }
+
+runTest() {
+  local msg=$1; shift
+  local expected=$1; shift
+  local actual=$( "$@" )
+  [[ "$actual" == "$expected" ]] || die "$msg: expected '$expected', got '$actual'"
+}
+
+scaleSuffixes=( '' k          m          g   ki      mi         gi )
+multipliers=(    1 1000 1000000 1000000000 1024 1048576 1073741824 )
+
+i=0
+for scale in "${scaleSuffixes[@]}"; do
+  multiplier=${multipliers[i++]}
+  # -- dimensionless, no formatting
+    cmd=( rpt -c "3$scale" . )
+    expected=$(( 3 * multiplier ))
+    descr="primary count, single-byte, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c "3$scale" .. )
+    expected=$(( (3 * 2) * multiplier ))
+    descr="primary count, multi-byte, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c "3$scale,2" . )
+    expected=$(( 3 * (2 + 1) * multiplier ))
+    descr="line-based, multi-col, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+  # -- with formatting
+    cmd=( rpt -c -s @ "3$scale" . )
+    expected=$(( 3 * multiplier + (3 * multiplier - 1) * 1 ))
+    descr="primary count, single-byte, scale '$scale', sep"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -t / "3$scale" . )
+    expected=$(( 3 * multiplier * (1 + 1)))
+    descr="primary count, single-byte, scale '$scale', term"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -d @ "3$scale" . )
+    expected=$(( 3 * multiplier * (2 + 1)))
+    descr="primary count, single-byte, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -d @ -s @  "3$scale" . )
+    expected=$(( 3 * multiplier * (2 + 1) + (3 * multiplier - 1) * 1 ))
+    descr="primary count, single-byte, scale '$scale', delim + sep"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -t @ -s @  "3$scale" . )
+    expected=$(( 3 * multiplier * (1 + 1) + (3 * multiplier - 1) * 1 ))
+    descr="primary count, single-byte, scale '$scale', term + sep"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -d @ -t @ -s @ "3$scale" . )
+    expected=$(( 3 * multiplier * (2 + 1) + 3 * multiplier * 1 + (3 * multiplier - 1) * 1 ))
+    descr="primary count, single-byte, scale '$scale', delim + term + sep"
+    runTest "$descr" "$expected" "${cmd[@]}"
+  # -- with target byte count
+    cmd=( rpt -c "3$scale"b .. )
+    expected=$(( 3 * multiplier ))
+    descr="primary count, target byte count, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale'"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -s @ "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale', sep:"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -t @ "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale', term:"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -s @ -d @ "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale', sep + delim:"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -s @ -t @ "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale', sep + term:"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+    cmd=( rpt -c -s @ -d @ -t @ "3$scale"b,10 .. )
+    expected=$(( 3 * multiplier ))
+    descr="line-based, target byte count, scale '$scale', sep + term + delim:"
+    runTest "$descr" "$expected" "${cmd[@]}"
+    # --
+done

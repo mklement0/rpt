@@ -1,564 +1,625 @@
-#!/usr/bin/env bash
+#!/usr/bin/env perl
 
-unset CDPATH
+# Require the most recent among the min. version required among all required modules here.
+# Use a float - e.g. 5.018002 for v5.18.2 - so that older Perl versions bow out gracefully too.
+use 5.007_003;  # min. required for `use Encode`
+use utf8; # Indicate that this script itself is UTF8-encoded.
+use Encode;
 
-kTHIS_NAME=$(basename "$BASH_SOURCE")
+# Locale-aware character encoding:
+# Note: We do NOT use open => ':locale', because it can slow output considerably.
+#       Instead, we decide case by case whether encoding is needed at all and turn layers on or off selectively.
+#       !! The only exception is for Windows output *to the terminal* (the console window), so that foreign chars. render legibly there too.
+#       !! Output to files is unaffected.
+use if ($^O eq 'MSWin32' and -t 1), open => OUT => ':locale';
 
-# Helper function for exiting with error message due to runtime error.
-#   die [errMsg [exitCode]]
-# Default error message states context and indicates that execution is aborted. Default exit code is 1.
-# Prefix for context is always prepended.
-# Note: An error message is *always* printed; if you just want to exit with a specific code silently, use `exit n` directly.
-die() {
-  echo "$kTHIS_NAME: ERROR: ${1:-"ABORTING due to unexpected error."}" 1>&2
-  exit ${2:-1} # Note: If the argument is non-numeric, the shell prints a warning and uses exit code 255.
+# Unix-like platforms: Decode @ARGV in-place from UTF-8 to Perl-internal Unicode strings.
+# !! Assumes UTF8-encoding. Sadly, there are no core modules that support determining the locale's actual encoding, but modern Unix-like platforms do use UTF-8.
+unless ($^O eq 'MSWin32') { for (@ARGV) { utf8::decode $_ }; }
+
+use strict;
+use warnings;
+
+use File::Basename; # for basename()
+use File::Spec;     # for File::Spec->devnull()
+# For options parsing:
+use Getopt::Long qw/:config bundling no_ignore_case no_auto_abbrev gnu_compat permute/;
+
+our $kTHIS_NAME = basename $0;
+our $kTHIS_HOMEPAGE='https://github.com/mklement0/rpt';
+our $kVERSION = 'v0.0.0'; # This line is automatically updated by `make version VER=<newVer>`
+# Convert $kVERSION into a backward-compatible float stored in `our $VERSION`.
+our $VERSION = sprintf '%s.%03s%03s', split(/\./, substr $kVERSION, 1);
+
+BEGIN {
+  # Debugging support: define p() for printing values diagnostically.
+  use Data::Dumper; $Data::Dumper::Terse = 1; $Data::Dumper::Sortkeys = 1; $Data::Dumper::Useperl = 1; sub p { print Dumper(@_); };
+  # -- Standard helper functions
+  sub mywarn { return if our $quiet; my $msg = $_[0]; chomp $msg; printf STDERR "$kTHIS_NAME: WARNING: %s\n", $msg; } 
+  sub mydie { my $msg = $_[0]; chomp $msg; printf STDERR "$kTHIS_NAME: ERROR: %s\n", $msg; exit 1; } 
+  sub mydiesyntax { my $msg = defined $_[0] ? $_[0] : ''; chomp $msg; printf STDERR "$kTHIS_NAME: ARGUMENT ERROR: %s\nUse -h for help.\n", $msg ? $msg : 'See above.'; exit 2; }
+  # SYNOPSIS
+  #   openurl <url>
+  # DESCRIPTION
+  #   Opens the specified URL in the system's default browser.
+  # COMPATIBILITY
+  #   OSX, Windows (including MSYS, Git Bash, and Cygwin), Freedesktop-compliant
+  #   OSs, which includes many Linux distros (e.g., Ubuntu), PC-BSD, OpenSolaris...
+  #   CYGWIN CAVEAT: if a URL contains something that looks like a shell
+  #     variable reference to an *existing* variable (e.g., %PATH%), the
+  #     value is inadvertently expanded; fortunately, that should rarely
+  #     happen in the real world.
+  # NOTES
+  #   To bypass variations in ad-hoc encoding across platforms, it is safer to
+  #   pass an already HTML-encoded URL (where, e.g., spaces are already encoded as '%20').
+  #   Gratefully adapted from http://stackoverflow.com/a/8869676/45375.
+  sub openurl {
+    my $url = shift;
+    my $platform = $^O;
+    my $cmd;
+    if    ($platform eq 'darwin')  { $cmd = "open \"$url\"";       }         # OS X
+    elsif ($platform eq 'MSWin32' or $platform eq 'msys') { $cmd = "start \"\" \"$url\""; }     # Windows native or Windows MSYS / Git Bash
+      # !! Cygwin: Bizarrely, the only way to get cmd.exe to treat the URL as a 
+      # !! literal (almost), is to *append a space*, which, fortunately, is ultimately 
+      # !! ignored by browsers. The only edge case where interpretation still happens
+      # !! is if the URL contains  syntactically valid reference to an *existing*
+      # !! environment variable; e.g., %PATH%.
+      # !! The following test URL demonstrates that all other special chars.
+      # !! are handled correctly:
+      # !!  http://example.org/test?foo^hat%20after%PATH1%&more=stuff(42<46)|@notsofast!
+    elsif ($platform eq 'cygwin')  { $cmd = "cmd.exe /c start \"\" \"$url \""; } # Cygwin; !! note the required trailing space
+    else { $cmd = "xdg-open \"$url\""; }  # assume a Freedesktop-compliant OS, which includes many Linux distros, PC-BSD, OpenSolaris, ...
+    if (system($cmd) != 0) {
+      die "Cannot locate or failed to open default browser; please go to '$url' manually.\n";
+    }
+  }  
+}
+# Redirect die() and warn() calls to our custom versions, stripping the location information ('... at /foo/bar line 666.')
+$SIG{__DIE__} = sub { my $msg = shift; $msg =~ s/ at .+? line .+$//; mydie $msg; };
+$SIG{__WARN__} = sub { my $msg = shift; $msg =~ s/ at .+? line .+$//; mywarn $msg; };
+
+
+# Deal with standard, info-only options.
+if (@ARGV) {
+  if ($ARGV[0] eq '--version') { 
+    print "${kTHIS_NAME} ${kVERSION}\n"; exit 0; 
+  }
+  elsif ($ARGV[0] eq '--home' and $kTHIS_HOMEPAGE) { openurl $kTHIS_HOMEPAGE; exit $? >> 8; }
+  elsif ($ARGV[0] =~ '^(-h|--help)$') { 
+    # Extract the contents of the SYNOPSIS chapter from the embedded Markdown-formatted man-page document.
+    my $txt = join '', <main::DATA>; close main::DATA;
+    $txt = (split /^#/m, (split /^## SYNOPSIS\n/m, $txt)[1])[0];
+    $txt =~ tr/`//d;  # remove ` chars.
+    print STDOUT $txt, "\n";
+    exit 0;
+  }
+  elsif ($ARGV[0] =~ m'^--(man|man-source)$') {
+    my $useembedded = $1 eq 'man-source'; # private option, used by `make update-man`
+    my $nullSink = File::Spec->devnull();
+    # Try to open the regularly installed man page first.
+    if ($useembedded or system("man 1 $kTHIS_NAME 2>$nullSink") != 0) {
+      # Fall back to printing the embedded Markdown man-page document.
+      # Determine the pager to use. Note that the pager simply passes output
+      # through if stdout is not connected to a terminal.
+      my $pager = 'more';
+      `which less 2>$nullSink`; $pager = 'less' if $? == 0;
+      # Extract the Markdown man-page document and pipe it to the pager.
+      open (my $outPipe, "| $pager");
+      print $outPipe <main::DATA>;
+      close main::DATA;
+      close $outPipe;
+    }
+    exit $? >> 8;
+  };
 }
 
-# Helper function for exiting with error message due to invalid parameters.
-#   dieSyntax [errMsg]
-# Default error message is provided, as is prefix and suffix; exit code is always 2.
-dieSyntax() {
-  echo "$kTHIS_NAME: ARGUMENT ERROR: ${1:-"Invalid argument(s) specified."} Use -h for help." 1>&2
-  exit 2
+# -- Script constants
+# Default location of the English dictionary on many Unix systems.
+my $kDICT_FILE = '/usr/share/dict/words';
+# Supported scale multipliers for counts.
+my %kSCALE_FACTORS = ( 
+  # decimal
+  k => 10**3,
+  m => 10**6,
+  g => 10**9,
+  # binary
+  ki => 2**10,
+  mi => 2**20,
+  gi => 2**30  
+);
+#
+# Pseudo count that signals the desire to produce endless (infinite) output (until killed)
+my $kCOUNT_ENDLESS = 'x';
+# Suffixes that designate a count as being a *character* count:
+my $kUNIT_SUFFIX_MAXCHARS = 'c';   # *at most* the number of chars. specified (NO truncation of repeat units)
+my $kUNIT_SUFFIX_FIXEDCHARS = 'f'; # *exactly* the number of chars. specified (truncation of last repeat unit, if necessary)
+my @kUNIT_SUFFIXES = (
+  $kUNIT_SUFFIX_MAXCHARS,  
+  $kUNIT_SUFFIX_FIXEDCHARS
+);
+
+# -- Parse options.
+my ($mode_staticText, $mode_numberedLines, $mode_randomLines, $mode_randomWords, $mode_randomBytes);
+my ($sep, $term, $delims);
+GetOptions(
+  # fundamental modes (in addition to default mode)
+  "numbered-lines|n"  => \$mode_numberedLines,
+  "random-lines|l"  => \$mode_randomLines,
+  "random-words|w"  => \$mode_randomWords,
+  "random-bytes|b"  => \$mode_randomBytes,
+  #
+  "separator|s=s"  => \$sep,
+  "terminator|t=s"  => \$term,
+  "delims|d=s"  => \$delims
+) or mydiesyntax;
+
+# -- Validate operands
+scalar(@ARGV) > 0 or mydiesyntax "Too few operands specified.";
+
+# 1st operand is always the count spec.
+my $countSpec = shift;
+# Break the count spec. into primary/line and optional per-line count: count[,perLineCount]
+my ($primaryCountSpec, $optComma, $optPerLineCountSpec, $unexpected) = split '(,)', $countSpec;
+if (length($unexpected) or not (length($primaryCountSpec) or length($optPerLineCountSpec))) { mydiesyntax "Invalid count specification: $countSpec"}
+
+# Whether additional operands are needed / supported depends on the mode.
+my ($text, $fmtText, $file);
+if ($mode_numberedLines) {
+  $fmtText = shift if @ARGV;
+} elsif ($mode_randomLines) {
+  $file = shift;
+  unless ($file) { mydiesyntax "Required file operand is missing."; }
+  unless (-f $file) { mydiesyntax "Not an existing or regular file: $file"; }
+} elsif ($mode_randomWords) {
+  $file = @ARGV ? shift : $kDICT_FILE;
+  unless (-f $file) { mydiesyntax "Dictionary file not found: $file"; }
+} elsif ($mode_randomBytes) {
+  # no operand expected
+} else {  # default mode
+  $mode_staticText = 1;
+  if (@ARGV) {
+    $text = shift;
+  } else { # read input from stdin (all at once)
+    $text = do { local $/; <STDIN> };
+    chomp $text;
+  }
+  unless ($text) { mydiesyntax "Text to repeat must not be empty."; }
 }
 
-# Recognized scale (multiplier, factor) suffixes
-kSCALE_SUFFIXES=(    k     m       g             ki    mi      gi  )
-kMULTIPLIERS=(       1000  1000000 1000000000    1024 1048576  1073741824 )
+# Ensure that a per-line count spec. is only specified for supported modes.
+if ($optComma) {
+  unless ($mode_staticText or $mode_randomWords) {
+    mydiesyntax "A per-line count is not supported with the specified mode option.";
+  }
+}
 
-kDEFAULT_NUMBERED_LINES_FORMAT='line %.0f'
+# At this point there should be no more operands.
+scalar(@ARGV) == 0 or mydiesyntax "Unexpected operand(s) specified: @ARGV";
 
-# Output version number and exit, if requested. Note that the `ver='...'` statement is automatically updated by `make version VER=<newVer>` - DO keep the 'v' suffix in the variable *definition*.
-[[ $1 == '--version' ]] && { ver='v0.0.0'; echo "${ver#v}"; exit 0; }
+# -- Validate the count spec.
 
-# Command-line help.
-if [[ "$1" == '--help' || "$1" == '-h' ]]; then
-  cat <<EOF
+# Determine if the output should be line-based.
+my $lineBased = defined $optComma; # if a comma was specified, even if not followed by a per-line count, the output is line-based.
 
-SYNOPSIS
-  $kTHIS_NAME [-c] -r count
-  $kTHIS_NAME [-c] -n [fmtText]
-  $kTHIS_NAME [-c] count[b][,[lineRepeatCount]] [text...]
+my (%primaryCountOpts, %perLineCountOpts);
+# Regex that parses a count spec. into <count><scale>?<char-units-suffix>?
+my $re = '^(\d+)' . '(' . join('|', keys(%kSCALE_FACTORS)) . ')?' . '(' . join('|', @kUNIT_SUFFIXES) . ')?$';
+my $i = -1;
+for ($primaryCountSpec, $optPerLineCountSpec) {
+  ++$i;
+  next unless length($_);
+  my $htRef = $i == 0 ? \%primaryCountOpts : \%perLineCountOpts;
+  if ($_ eq $kCOUNT_ENDLESS) {
+    ${$htRef}{endless} = 1;
+  } else {
+    m/$re/ or mydiesyntax "Not a valid count spec.: $_";
+    ${$htRef}{count} = $2 ? $kSCALE_FACTORS{$2} * $1 : $1;
+    ${$htRef}{charmode} = $3 if $3;      
+  }  
+}
+# Detect edge cases: default counts
+if (not %primaryCountOpts) {
+  # ,<perLineCount>  (no primary count) -> default primary count to 1
+  $primaryCountOpts{count} = 1;
+} elsif ($optComma and not %perLineCountOpts) {
+  # <primaryCount>, (comma, but no per-line count) -> default per-line count to 1
+  $perLineCountOpts{count} = 1;
+}
 
-DESCRIPTION
-  Repeats text or random bytes or numbered lines a specifiable number of times
-  or until a target byte count is reached, typically to create test data.
-  Output is sent to stdout.
+# p \%primaryCountOpts;
+# p \%perLineCountOpts;
 
-  <count>, irrespective of any unit suffix, can be scaled with a
-  *scale suffix*:
-      ${kSCALE_SUFFIXES[*]}
-    representing the following multipliers ('i' denotes binary ones):
-      ${kMULTIPLIERS[*]}
-  E.g., '2k' represents 2,000, '1gi' represents 1,073,741,824 (1024^3).
-  With a scale suffix, you may optionally specify the count as a float; e.g.,
-  '.5k' for 500, or '1.5mi' for 1,572,864 (1.5 * 1024^2).
-  Be careful with large multipliers, as the resulting data can take
-  a long time to produce. Creating random data (-r) is fastest.
+# p uc $text;
 
-  -c (all synopsis forms)
-    count-only: only outputs the total number of bytes that *would* be 
-    generated, without actually generating data.
-    The number is output as an unscaled integer.
-    Also useful for measuring the (total) byte length of TEXT containing
-    multi-byte characters.
+# -- Dispatch to mode-specific helper functions
 
-  1st synopsis form: outputs random bytes:
-    With -r, <count> invariably specifies the number of random *bytes* to
-    output, generated via /dev/urandom. Note that the output may include
-    non-printable chars., including NUL.
+if ($mode_numberedLines) {
 
-  2nd synopsis form: outputs numbered lines:
+  genNumberedLines($primaryCountSpec, $fmtText);
 
-    Note: This form relies on the presence of the \`seq\` utility, and the 
-    output lines are numbered sequentially, starting with 1.
+} elsif ($mode_randomLines) {
+} elsif ($mode_randomWords) {
+} elsif ($mode_randomBytes) {
 
-    -n ... outputs <countLines> sequentially numbered lines.
-      If <fmtText> is not specified, the default is '$kDEFAULT_NUMBERED_LINES_FORMAT',
-      resulting in 'line 1', 'line 2', ...
-      <fmtText> is a constrained printf-style format string for use by \`seq\`,
-      which may contain arbitrary text combined with exactly one format
-      specifier for the line number, using one of the following:
-      %E, %e, %f, %G, %g
-      To avoid switching to exponential notation with numbers >= 1,000,000, 
-      use '%.0f'. As with `\printf\`, you may specify a fixed field width, with
-      either left-space padding (e.g., `%4.0f`) or left-zero-padding
-      (e.g., `%04.0f`).
+  genRandomBytes($primaryCountOpts{endless} ? -1 : $primaryCountOpts{count});
 
-  3rd synopsis form: outputs instances of the specified text:
+} elsif ($mode_staticText) {
 
-    If <text> is not given, input is read from stdin.
+  repeat($countSpec, $text, ( sep => $sep, term => $term, delims => $delims ));
+
+} else { # Should never get here.
+  die "DESIGN ERROR: Unanticipated mode."
+}
+
+exit;
+# --------------------------
+
+# SYNOPSIS
+#     repeat(countSpec, text[, options])
+sub repeat {
   
-    In addition to the scale suffix described above, the following *unit
-    suffixes* may be specified:
-      (none) ...  by default, specifies the count of multiples of the input to
-        create, whatever its length.
-      b ... the total number of *bytes* to output
-        Note that the exact byte count is enforced, meaning that multiples of
-        the input are cut off as needed, possibly even inside a multi-byte
-        character.
-      ,[lineRepeatCount] ... places each replicated instance of the input on
-        its own output line, optionally <lineRepeatCount> times, if specified.
+  my ($countSpec, $text, %opts) = @_;
+  my $nl = $^O eq 'MSWin32' ? "\r\n" : "\n";
+  my $nlLen = $^O eq 'MSWin32' ? 2 : 1;
 
-EXAMPLES
-  $kTHIS_NAME 3 x         # -> 'xxx'
-  $kTHIS_NAME 3, 'ab'     # -> $'ab\nab\nab\n'
-  $kTHIS_NAME 10,80 x     # -> 10 lines with 80 'x' chars. each
-  $kTHIS_NAME 1kb,80 x > out # create 1000-byte file 'out' filled 
-                             # with lines of 80 'x' chars. each
-  $kTHIS_NAME -r .5ki > out # create file 'out' with 512 random bytes
-  $kTHIS_NAME -r 1m > out   # create file 'out' with 10^6 random bytes
-  $kTHIS_NAME -c 1 'Hï'     # -> 3: the number of bytes in the string (UTF8)
-EOF
-    exit 0
-fi
+  die "Invalid arguments." unless length($countSpec) > 0 and length($text) > 0;
+  
+  # Determine I/O layers:
+  # Unix-like platforms:
+  #   Use :unix rather than the default :perlio for performance reasons: :unix is lower-level and unbuffered
+  #   (:perlio actually builds on it).
+  #   Additionally, we activate :utf8 only if the input string contains non-ASCII characters, because the
+  #   :utf8 pseudo-layer also slows processing.
+  #   !! Note that UTF-8 is HARD-CODED as an assumption; fortunately, all locales on modern Unix-like platforms are UTF-8-based.
+  # Windows:
+  #   NO performance optimization: We need the default :crlf for proper CRLF translation, which means
+  #   we're stuck with :perlio.
+  #   We make NO attempt to support anything other than the default encoding: bytes are passed through,
+  #   characters are assumed to be single-byte; but see the global exception for outputting to the terminal (console window) at the top.
+  binmode STDOUT, (Encode::is_utf8($text) ? ':unix :utf8' : ':unix') unless $^O eq 'MSWin32';
 
+  # printf STDERR join (', ', PerlIO::get_layers(STDOUT)) . "\n"; 
+  # p $countSpec, $text, \%opts; # 
+
+  # -- Parse the count spec.
+  my (%primaryCountOpts, %perLineCountOpts);
+  # Regex that parses a count spec:
+  #  $1 == mere number, $2 (optional) == scale factor such as 'k', $3 (optional) is count-is-characters-mode indicator 'c' or 'f'
+  my $re = '^(\d+)' . '(' . join('|', keys(%kSCALE_FACTORS)) . ')?' . '(' . join('|', @kUNIT_SUFFIXES) . ')?$';
+  my $lineBased = $countSpec =~ /,/; # The presence of a ',' implies the desire to output line by line.
+  my @subCountSpecs = split ',', $countSpec;
+  die "Invalid count spec.: $countSpec" if scalar(@subCountSpecs) > 2;
+  my $i = -1;
+  for (@subCountSpecs) {
+    my $htRef = ++$i == 0 ? \%primaryCountOpts : \%perLineCountOpts;
+    if (length($_) == 0) { # an empty sub-count spec. implies a count of 1
+      ${$htRef}{count} = 1;
+    } elsif ($_ eq $kCOUNT_ENDLESS) {
+      ${$htRef}{endless} = 1;
+    } else {
+      m/$re/ or die "Not a valid count spec.: $_";
+      ${$htRef}{count} = $2 ? $kSCALE_FACTORS{$2} * $1 : $1;
+      ${$htRef}{charmode} = $3 if $3;      
+    }  
+  }
+  # Translate into line and per-line spec.
+  if (! %perLineCountOpts) {
+    if ($lineBased) {
+      $perLineCountOpts{count} = 1;
+    } else {
+      %perLineCountOpts = %primaryCountOpts;
+      $primaryCountOpts{count} = 1;
+    }
+  }
+
+  # p \%primaryCountOpts, \%perLineCountOpts, $lineBased;
+
+  # -- Synthesize the repeat unit.
+  my $sep = $opts{sep};
+  my $rptUnit = $text;
+  if ($opts{delims}) {
+    my ($delimOpen, $delimClose);
+    $delimOpen = $delimClose = $opts{delims}; 
+    if (length($delimOpen) > 1 ) {
+      $delimOpen = substr $delimOpen, 0, length($delimOpen) / 2;
+      $delimClose = substr $delimClose, length($delimOpen);
+    }
+    $rptUnit = sprintf '%s%s%s', $delimOpen, $text, $delimClose;
+  }
+  $rptUnit .= $opts{term} if $opts{term};
+
+  # -- Start repeating
+
+  my $lineCount = $primaryCountOpts{count};
+  my $perLineCount = $perLineCountOpts{count};
+  my $endless = $primaryCountOpts{endless};
+  my $endlessLine = $perLineCountOpts{endless};
+  my $iLine = 0;
+  while ($endless or ++$iLine <= $lineCount) {
+    if ($endlessLine) {
+      $rptUnit .= $sep if (defined $sep);
+      while (1) { print $rptUnit; }
+    } else {
+      my $line;
+      if (! defined $line) {
+        # !! Building up the entire a line in memory can be problematic.
+        if ($sep and $perLineCount > 1) {
+          $line = (($rptUnit . $sep) x ($perLineCount-1)) . $rptUnit;
+        } else {
+          $line = $rptUnit x $perLineCount;
+        }
+      }
+      print $line;
+    }
+
+    print "\n" if $lineBased;
+
+  }
+
+  # When outputting to a terminal, add a trailing newline to output that
+  # doesn't already end in one, for readability.
+  unless ($lineBased) {
+    print "\n" if -t 1;
+  }
+
+  # p "unit: ", $rptUnit;
+
+  # if ($lineBased;
+
+  # while ()
+
+}
 
 # SYNOPSIS
-#   repeat [-b|-B] [-s sep] [-d delim] [-t trm] count [text...]
+#   genRandomBytes <count>
 # DESCRIPTION
-#   Repeats (replicates) string <text> <count> times. NO \n is appended to the output.
-#   If <text> is not specified, its value is read from stdin.
-#     -b (default) / -B
-#        Makes / does NOT make <text>, <sep>, <delim>, and <trm> *subject to interpretation of backslash escape sequences* (e.g., '\n')
-#     -s sep (default: empty)
-#       Specifies a separator string to place *between* instances of <text>.
-#     -d delimiter (default: empty)
-#       Specifies a delimiter string to place *around* instances of <text>.
-#       If <delimiter> is a single char., that char is used as both the opening and closing delimiter.
-#       Otherwise, the first half of <delimiter> is used as the opening one, and the 2nd half as the closing one.
-#     -t trm (default: empty)
-#       Specifies a terminator string to place *after* every instance of <text>, including the last one.
-# IMPLEMENTATION NOTES
-#   Uses perl, if available, awk otherwise.
-# EXAMPLES
-#      repeat 3 'x' # -> 'xxx' 
-#      repeat -s @ 5 'x' # -> 'x@x@x' 
-#      repeat -b 3 'line\n' - # -> $'line\nline\nline\n' (3 lines)
-#      repeat -B -s ' ' 3 'a\b' - # -> 'a\b a\b \ab' 
-#      repeat -s ' ' -d '[]' 3 'a' - # -> '[a] [a] [a]' 
-repeat() {
-  local OPTARG= OPTIND=1 opt interpret sep delimOpen delimClose trm count fmt txtRaw txt txtUnit
-  interpret=1 sep= delimOpen= delimClose= trm= # defaults
-  while getopts ':bBs:t:d:' opt; do
-    [[ $opt == '?' ]] && { echo "ARGUMENT ERROR: Unknown option: -$OPTARG" >&2; return 2; }
-    [[ $opt == ':' ]] && { echo "ARGUMENT ERROR: Option -$OPTARG is missing its argument." >&2; return 2; }
-    case "$opt" in
-      b)
-        interpret=1
-        ;;
-      B)
-        interpret=0
-        ;;
-      s)
-        sep=$OPTARG
-        ;;
-      d)
-        if (( ${#OPTARG} == 1 )); then
-          delimOpen=$OPTARG
-          delimClose=$delimOpen
-        else
-          delimOpen=${OPTARG: 0: ${#OPTARG} / 2}
-          delimClose=${OPTARG: ${#delimOpen}}
-        fi
-        ;;
-      t)
-        trm=$OPTARG
-        ;;
-      *)
-        { echo "DESIGN ERROR: option -$opt not handled." >&2; return 3; }
-        ;;
-    esac
-  done
-  shift $((OPTIND - 1)) # Skip the already-processed arguments (options).
+#   Outputs the specified number of random bytes to stdout.
+#   <count> must be a count >= 0 or -1 to signal endless output.
+# PREREQUISITES
+#   Requires special character device /dev/urandom (Unix-like platforms only)
+#   and either BSD or GNU `head`.
+sub genRandomBytes {
 
-  # Validate the count and convert it to a decimal.
-  count=$(set -u; echo $(( $1 ))) >/dev/null # Sadly, Bash's error message in the event that the input is not a number cannot be suppressed.
-  [[ -n $count ]] && (( count >= 0 )) || { echo "ARGUMENT ERROR: '$1' is not a valid repeat count. Please specify an integer >= 0 in either decimal, hex, or octal form." >&2; return 2; }
-  shift
+  my $count = shift;
+  my $randSource = '/dev/urandom'; # endless source of pseudo-random bytes
 
-  if (( $# == 0 )); then # read from stdin - all input at once.
-    IFS= read -d $'\x4' -r txtRaw
-  else # all remaining operands (though typically only 1)
-    txtRaw=$*
-  fi
+  return if $count == 0;
 
-  # Determine the printf format to apply, depending on whether backslash escape sequences should be interpreted or not.
-  (( interpret )) && fmt='%b' || fmt='%s'
+  -c $randSource or die "Cannot generate random bytes, because your system lacks special file '$randSource'.";
 
-  # Determine the dressed-up unit of text to replicate.
-  txtUnit="${delimOpen}${txtRaw}${delimClose}${trm}" # delimiters and terminator applied - but NOT the separator
-  # With a separatore specified, we append it to the unit, but only print count *minus 1* instances,
-  # so that we can print the final instance without separator afterward.
-  [[ -n $sep ]] && { txt=${txtUnit}${sep}; (( --count )); } || txt=$txtUnit
+  binmode STDOUT;  # make sure that raw bytes are output
 
-  if (( count )); then
-    if [[ -n $(command -v perl) ]]; then # use Perl, if available: it's faster with high repeat counts.
-      # echo "[??perl]"
-      # Note that we must pass the count as an ad-hoc *environment* variable, since we're using -n
-      # to pass the (interpreted) text as a file (we pass the text via stdin, because using
-      # a variable that captures the output from printf using a command substitition would eat trailing newlines).
-      # !! For FreeBSD compatibility we avoid process substitution.
-      printf "$fmt" "$txt" | count=$count perl -0777 -ne 'print $_ x $ENV{count};'
-    else # otherwise: use awk: still reasonably fast, but perl is much faster esp. with high repeat counts.
-      # echo "[??awk]"
-      # Note that we pass the text as a *file* rather than with `-v var=value`, because that
-      # way we can pass multi-line strings and control if and when backslash interpretation occurs.
-      # (Such interpretation is *invariably* applied to `-v var=...` values.)
-      # !! For FreeBSD compatibility we avoid process substitution.
-      # !! Do NOT use `NF=101`, because it crashes BSD awk.
-      printf "$fmt" "$txt" | awk -v count=$(( count + 1 )) -v RS=$'\3' -v ORS=  'BEGIN { getline OFS; $count=""; print }'
-    fi
-  fi
+  if ($count == -1) {  # signals endless output
+    system "cat $randSource" and die "$!";
+  } else {
+    # Note: head -c is NON-POSIX and requires either BSD or GNU utilities
+    system "head -c $count $randSource" and die "$!";
+  }
 
-  [[ -n $sep ]] && (( count >= 0 )) && printf "$fmt" "$txtUnit" # print last instance without trailing separator
-
+  return;
 }
 
-
 # SYNOPSIS
-#   repeat_singleByte count single-byte-char
+#   genNumberedLines count[scale-factor][c|f], [fmt]
 # DESCRIPTION
-#   If Perl is not available, this is a more efficient alternative to repeat() for a given single byte.
-# IMPLEMENTATION NOTES
-#   Uses Perl, if available, head -c otherwise. Perl is much faster.
-#   E.g.: Creating 10^9 bytes (1 metric GB) on a 3.2 Ghz machine takes about 3.5 secs with perl, almost 2 minutes(!) with head -c + tr (and around 6 minutes with awk).
-repeat_singleByte() {
-  if [[ -f $(command -v perl1) ]]; then # use perl, if available: it's much faster with high repeat counts.
-      perl -e 'print $ARGV[1] x $ARGV[0];' "$1" "$2"
-  else # otherwise, use head -c + tr, which is (a) much slower, and (b), not POSIX-compliant (while POSIX tail has a -c option for bytes, head does not).
-    ## use dd (as POSIX utility), which is much slower, however.
-    # # !! `dd` accepts a maximum of 2147483647 as the block size, so we need to *chunk* the output accordingly.
-    # local passes=$(( $1 / 2147483647 )) rest=$(( $1 % 2147483647 )) thisPassByteCount i
-    # for (( i = 0; i <= $passes; i++ )); do
-    #   (( i == passes )) && thisPassByteCount=$rest || thisPassByteCount=2147483647
-    #   dd if=/dev/zero bs=$thisPassByteCount count=1 2>/dev/null | tr '\0' "$2" || return
-    # done
-    head -c "$1" /dev/zero | tr '\0' "$2"
-  fi
-}
-
-# Outputs the specified number of random bytes.
-repeat_randomBytes() {
-  # # !! `dd` accepts a maximum of 2147483647 as the block size, so we need to *chunk* the output accordingly.
-  # local passes=$(( $1 / 2147483647 )) rest=$(( $1 % 2147483647 )) thisPassByteCount i
-  # for (( i = 0; i <= $passes; i++ )); do
-  #   (( i == passes )) && thisPassByteCount=$rest || thisPassByteCount=2147483647
-  #   dd if=/dev/urandom bs=$thisPassByteCount count=1 2>/dev/null || return
-  # done
-  head -c "$count" /dev/urandom
-}
-
-# Converts all arguments to *decimal integers* (i.e.: strings representing the input number with base 10), if possible, and outputs one number per line.
-# By default, positive and negative integers are accepted, but when invoked by a function named 'toPosInt', only positive (>= 0) integers are accepted.
-# Acceptable number formats are: DECIMAL, HEX (PREFIX '0x' OR '0X'), OCTAL (PREFIX '0') - LEADING AND TRAILING WHITESPACE IS IGNORED.
-# Exit code is 0 if ALL arguments were recognized as numbers of the expected type, 1 otherwise - processing stops with the first argument that's not a number.
-# Examples:
-#   n=$(toInt $1) || echo "$1 is not an integer."
-#   toInt 0x10 010 -77 # -> $'16\n8\n-77'
-# See also: isInt()
-toInt() {
-  local nRaw n positiveOrZeroOnly=0 basePrefix digits
-  [[ ${FUNCNAME[1]} == 'toPosInt' ]] && positiveOrZeroOnly=1
-  (( $# )) || return 1  # no input -> not an integer
-  for nRaw in "$@"; do
-    # !! Sadly, blindly trying to convert with $(( ... )) results in *instant return with error code 1 and an error message that cannot be suppressed* for numbers with invalid bases such as '08'.
-    # !! Conversely, a non-number - such as whitespace or text that could be a variable name - silently results in output '0'.
-    # !! (We could use `set -u` in a subshell to trigger errors in case of undefined variables, but there could still be accidental matches with currently defined shell variables.)
-    # !! Thus, we try to weed out non-numbers or invalid numbers with a regex first, but limit ourselves to the most frequently used number bases: decimal, octal, hex.
-    # We accept, in order:
-    #   optional: leading whitespace
-    #   optional: either + or - sign
-    #   optional: base prefix:
-    #      0 ... octal
-    #      0x or 0X .. hex
-    #   mandatory: at least 1 digit
-    #   optional: trailing whitespace
-    [[ $nRaw  =~ ^[[:space:]]*[-+]?(0[xX]?)?([0-9A-Fa-f]+)[[:space:]]*$ ]] || return 1
-    basePrefix=${BASH_REMATCH[1]} digits=${BASH_REMATCH[2]}
-    case "$basePrefix" in
-      0x|0X) # hex
-        : # already validated by the regex above
-        ;;
-      0) # octal
-        [[ $digits =~ ^[0-7]+$ ]] || return 1
-        ;;
-      *) # decimal
-        [[ $digits =~ ^[0-9]+$ ]] || return 1
-        ;;  
-    esac
-    # At this point we can confidently convert to a decimal using $(( ... )).
-    n=$(( nRaw )) || return 1
-    # If requested, ensure that the number is >= 0.
-    (( positiveOrZeroOnly && n < 0 )) && return 1
-    echo "$n"
-  done
-  return 0
-}
-
-
-# Converts all arguments to *positive (>=0) decimal integers* (i.e.: strings representing the input number with base 10), if possible, and outputs one number per line.
-# See toInt() for details.
-# Example:
-#   n=$(toPosInt $1) || echo "$1 is not a positive integer."
-toPosInt() { toInt "$@"; } # !! NO extra arg needed; toInt() modifies its behavior based on the name of the invoking function.
-
-
-# SYNOPSIS
-#     indexOf needle "${haystack[@]}"
-# *Via stdout*, returns the zero-based index of a string element in an array of strings or -1, if not found.
-# The *return code* indicates if the element was found or not.
+#   Generates <count> numbered lines or, if <count> is suffixed with 'c' or 'f',
+#   as many numbered lines as needed until the desired character count is
+#   reached:
+#   'c' produces *at most* <count> characters, without truncating the last
+#   output line.
+#   'f' produces *exactly* <count> characters (fixed count, truncating the
+#   last output line as needed.
+#   <scale-factor> may be one of k, m, g (decimal) or ki, mi, gi.
+#
+#   Alternatively, the count operand may be 'x', in which case endless output
+#   is produced.
+#
+#   Note that a character count doesn't necessarily equal the same byte count,
+#   if the active locale uses UTF-8 character encoding, as is typical nowadays.
+# 
+#   <fmt> is a printf format string that defaults to 'line %.0f'.
+#   
 # EXAMPLE
-#   a=('one' 'two' 'three')
-#   ndx=$(indexOf 'two' "${a[@]}") # -> $ndx is now 1
-indexOf() {
-  local e ndx=-1
-  for e in "${@:2}"; do (( ++ndx )); [[ "$e" == "$1" ]] && echo $ndx && return 0; done
-  echo '-1'; return 1
+#   genNumberedLines(10)  # -> "line 1\nline 2\n...""
+#   genNumberedLines(1000c, 'line %03d') # -> "line 001\n..." up to a *max.* of 1000 chars.
+#   genNumberedLines(1000f) # -> "line 1\nline 2\n..." with *exactly* 1000 chars.
+sub genNumberedLines {
+
+  my ($countSpec, $fmt) = @_;
+  
+  # Determine I/O layers:
+  # Unix-like platforms:
+  #   Use :unix rather than the default :perlio for performance reasons: :unix is lower-level and unbuffered
+  #   (:perlio actually builds on it).
+  #   Additionally, we activate :utf8 only if the input string contains non-ASCII characters, because the
+  #   :utf8 pseudo-layer also slows processing.
+  #   !! Note that UTF-8 is HARD-CODED as an assumption; fortunately, all locales on modern Unix-like platforms are UTF-8-based.
+  # Windows:
+  #   NO performance optimization: We need the default :crlf for proper CRLF translation, which means
+  #   we're stuck with :perlio.
+  #   We make NO attempt to support anything other than the default encoding: bytes are passed through,
+  #   characters are assumed to be single-byte; but see the global exception for outputting to the terminal (console window) at the top.
+  binmode STDOUT, (Encode::is_utf8($text) ? ':unix :utf8' : ':unix') unless $^O eq 'MSWin32';
+
+  $fmt = 'line %.0f' unless length($fmt);
+  chomp $fmt; $fmt .= "\n";
+
+  my $endless; my $count;
+  my $exact = 0; my $maxChars = 0; my $charsSoFar = 0;
+  if ($countSpec eq 'x') {
+    $endless = 1;
+  } else {    
+    my %kSCALE_FACTORS = ( 
+      # decimal
+      k => 10**3,
+      m => 10**6,
+      g => 10**9,
+      # binary
+      ki => 2**10,
+      mi => 2**20,
+      gi => 2**30  
+    );
+    # Regex: $1 == mere number, $2 (optional) == scale factor such as 'k', $3 (optional) is
+    #        count-is-characters-mode indicator 'c' or 'f'
+    my $re = '^(\d+)' . '(' . join('|', keys(%kSCALE_FACTORS))  . ')?' . '(c|f)?$';
+    $countSpec =~ /$re/ or die "Invalid count spec.: $count";
+    $count = $1;
+    if ($2) {
+      $count *= $kSCALE_FACTORS{$2};
+    }
+    if ($3) {
+      $maxChars = $count;
+      $exact = $3 eq 'f';
+    }
+    return undef if $count == 0;
+  }
+
+  my $i = 0; my ($line, $chars);
+  while (++$i) {
+    $line = sprintf $fmt, $i; $chars=length($line);
+    if ($maxChars && $charsSoFar + $chars >= $maxChars) {
+      if ($exact) {
+        $line = substr($line, 0, $maxChars - $charsSoFar);
+        $i = $count; # exit after this iteration
+      } else {
+        last;
+      }
+    }
+    print $line;
+    $charsSoFar += $chars;
+    if (! $endless) {
+      last if $i == $count;
+    }
+  }
+
+  return undef;
 }
 
-# -------------------------
 
-# Parse options.
-countIsTotalSize=0
-randomBytes=0
-countOnly=0
-sep=
-numberedLines=0
-numberedLinesFormat=$kDEFAULT_NUMBERED_LINES_FORMAT
-while getopts ':rcnf:' opt; do
-  [[ $opt == '?' ]] && dieSyntax "Unknown option: -$OPTARG"
-  [[ $opt == ':' ]] && dieSyntax "Option -$OPTARG is missing its argument."  
-  case "$opt" in
-    # l)
-    #   sep='\n'
-    #   ;;
-    # t)
-    #   countIsTotalSize=1
-    #   ;;
-    r)
-      randomBytes=1
-      ;;
-    c)
-      countOnly=1
-      ;;
-    n)
-      numberedLines=1
-      ;;
-    *)
-      die "DESIGN ERROR: option -$opt not handled."
-      ;;
-  esac
-done
-shift $((OPTIND - 1)) # Skip the already-processed arguments (options).
 
-countRaw=$1; shift # Note: the count is validated below.
-# Make sure that at least a count was specified.
-[[ -n $countRaw ]] || dieSyntax "Too few arguments specified."
+####
+# MAN PAGE MARKDOWN SOURCE
+#  - Place a Markdown-formatted version of the man page for this script
+#    below the `DATA` line below.
+#  - Do not alter the `DATA` line in any way.
+#  - The entire rest of this script
+#    is assumed to be the Markdown document.
+#  - The document must be formatted to look good in all 3 viewing scenarios:
+#     - as a man page, after conversion to ROFF with marked-man
+#     - as plain text (raw Markdown source)
+#     - as HTML (rendered Markdown)
+#  Markdown formatting guidelines:
+#   - GENERAL
+#     To support plain-text rendering in the terminal, limit all lines to 80 chars.,
+#     and, for similar rendering as HTML, *end every line with 2 trailing spaces*.
+#   - HEADINGS
+#     - For better plain-text rendering, leave an empty line after a heading
+#       marked-man will remove it from the ROFF version.
+#     - The first heading must be a level-1 heading containing the utility
+#       name and very brief description; append the manual-section number 
+#       directly to the CLI name; e.g.:
+#         # foo(1) - does bar
+#     - The 2nd, level-2 heading must be '## SYNOPSIS' and the chapter's body
+#       must render reasonably as plain text, because it is printed to stdout
+#       when  `-h`, `--help` is specified:
+#         Use 4-space indentation without markup for both the syntax line and the
+#         block of brief option descriptions; represent option-arguments and operands
+#         in angle brackets; e.g., '<foo>'
+#     - All other headings should be level-2 headings in ALL-CAPS.
+#   - TEXT
+#      - Use NO indentation for regular chapter text; if you do, it will 
+#        be indented further than list items.
+#      - Use 4-space indentation, as usual, for code blocks.
+#      - Markup character-styling markup translates to ROFF rendering as follows:
+#         `...` and **...** render as bolded (red) text
+#         _..._ and *...* render as word-individually underlined text
+#   - LISTS
+#      - Indent list items by 2 spaces for better plain-text viewing, but note
+#        that the ROFF generated by marked-man still renders them unindented.
+#      - End every list item (bullet point) itself with 2 trailing spaces too so
+#        that it renders on its own line.
+#      - Avoid associating more than 1 paragraph with a list item, if possible,
+#        because it requires the following trick, which hampers plain-text readability:
+#        Use '&nbsp;<space><space>' in lieu of an empty line.
+####
+__DATA__
+# rpt(1) - repeat text, numbered lines, random lines or bytes
 
-# Check for incompatible arguments - more checks below.
-(( randomBytes && $# > 0 )) && dieSyntax "Incompatible arguments specified."
+## SYNOPSIS
 
-# ===== Perform the following case-INsensitively.
-countIsTotalSize=0 lineBasedOutput=0 perLineRepeatCount=1
-mustReset=$(shopt -q nocasematch; echo $?); shopt -s nocasematch
+Repeat STATIC TEXT:
 
-  # Split count into number and suffixes, if any (scale, unit, per-line repeat count).
-  suffix=
-  suffixChars=$(IFS=''; echo "${kSCALE_SUFFIXES[*]}")
-  reSuffixes=$(IFS='|'; echo "${kSCALE_SUFFIXES[*]}")
+    rpt [<fmtOpts>] <count>[c|f][,[<perLineCount>[c|f]]] [<text>]
 
-  if [[ $countRaw =~ ^([^,b$suffixChars]+)(${reSuffixes})?(b)?(,.*)?$ ]]; then
+    <fmtOpts> control per-line formatting:
 
-    countRaw=${BASH_REMATCH[1]}; scale=${BASH_REMATCH[2]}; unit=${BASH_REMATCH[3]}; perLineSpec=${BASH_REMATCH[4]}
+    -s <sep>     separator to place between units
+    -t <term>    terminator to place after every unit
+    -d <delims>  delimiters around each unit
 
-    # Validate the per-line spec, if specified.
-    if [[ -n $perLineSpec ]]; then
-        (( ! (randomBytes || numberedLines) )) || dieSyntax "Incompatible arguments specified."
-        lineBasedOutput=1
-        if (( ${#perLineSpec} > 1 )); then
-            perLineRepeatCount=$(toPosInt "${perLineSpec:1}") || dieSyntax "'${perLineSpec:1}' is not a positive integer."
-        fi
-    fi
+Generate NUMBERED LINES:
 
-    # pv countRaw scale unit perLineSpec # ??
+    rpt -n        <count>[c|f] [<fmtText>]
 
-    [[ $unit == 'b' ]] && countIsTotalSize=1
+Output RANDOM LINES from a file:
 
-    # Look up multiplier by scale, if specified
-    multiplier=1
-    if [[ -n $scale ]]; then
-      multiplierNdx=$(indexOf "$scale" "${kSCALE_SUFFIXES[@]}")
-      multiplier=${kMULTIPLIERS[multiplierNdx]}
-    fi
+    rpt -l        <count>[c|f] <file>
 
-    # Validate the number part:
-    # First, see if it's an integer (and convert to decimal format):
-    haveInt=0
-    count=$(toPosInt "$countRaw") && haveInt=1
-    if (( haveInt )); then # an integer
-      # Apply the multiplier.
-      (( count *= multiplier ))
-    else # either a float or an invalid number
+Generate RANDOM WORDS:
 
-      # We only accept floats with multipliers > 1.
-      (( multiplier > 1 )) || dieSyntax "'$countRaw' is not a positive integer."
+    rpt -w        <count>[c|f][,[<perLineCount>[c|f]]] [<dictFile>]
 
-      errMsg="'$countRaw' is not a positive integer or decimal fraction."
+Generate RANDOM BYTES:
 
-      # Crude test: float must start with digit or '.'
-      [[ $countRaw =~ ^[0-9.] ]] || dieSyntax "$errMsg"
+    rpt -b        <count>
 
-      # Apply the multiplier, implicitly validating the number as a float.
-      # !! Sadly, bc never sets a nonzero exit code, ignores all-letter tokens silently, but at least outputs '[...] parse error' to stderr for mixed digit-letter tokens such as '1a'.
-      count=$(bc <<<"$countRaw * $multiplier" 2>&1)
-      [[  $count =~ 'error' ]] && dieSyntax "$errMsg"
-      
-      # Simply round down to nearest integer (lop off everything starting with the decimal point).
-      count=${count%.*}
-          
-    fi
+Shared count specifications:
 
-  else # No known suffix detected - we require an INTEGER.
+    Counts may be scaled with multipliers (e.g., `2m`):
+    Decimal:
+      k     m       g      
+      1000  10^6    10^9
+    Binary:
+      ki    mi      gi
+      1024  1048576 1073741824
 
-    # Validate the number.
-    count=$(toPosInt "$countRaw") || dieSyntax "'$countRaw' is not a positive integer or has unknown suffix."
+    'x' in lieu of a number outputs endlessly.
 
-  fi
+    By default, counts specify how often to repeat the input or, for
+    line-based output, the number of output lines;
+    a terminal 'c' or 'f' switches to character count:
+      'c'    at most as many chars. as specified, no truncation
+      'f'    exactly as many chars. as specified, may truncate
 
-(( mustReset )) && shopt -u nocasematch
-# ======
+## DESCRIPTION
 
-# Produce the requested data.
-# PERFORMANCE NOTES:
-#  Due to our implementation, RANDOM data is the FASTEST to produce, with the single-byte data and multi-byte/char data taking about twice as long.
-#  Example timings from a late 2012 iMac:
-# $ time rpt -r 1.5gi >out1  # RANDOM
-#   real  1m53.387s
-#   user  0m0.008s
-#   sys 1m45.002s
-# $ time rpt 1.5gi >out2  # SINGLE-BYTE
-#   real  3m1.468s
-#   user  2m57.457s
-#   sys 0m4.273s
-# $ time rpt -lt 1.5gi "$(rpt -t 79 'abc ')" >out3  # MULTI-BYTE/CHAR
-#   real  3m22.747s
-#   user  2m48.765s
-#   sys 0m34.479s
+## OPTIONS
 
-# Edge case: Exit, if count is 0, possibly preced by printing "0", if -c was specified.
-if (( count == 0 )); then
-  (( countOnly )) && echo "$count"
-  exit 0  # Nothing to do.
-fi
+  * `-q`, `--quiet`  
+   quiet mode
 
-if (( randomBytes )); then  # RANDOM bytes
+## STANDARD OPTIONS
 
-  # DRY RUN: only print the total count of bytes that *would* be generated and exit.
-  if (( countOnly )); then
-    echo "$count"
-    exit 0
-  fi
+All standard options provide information only.
 
-  # Output as many random bytes as requested.
-  repeat_randomBytes $count || die
+ * `-h, --help`  
+   Prints the contents of the synopsis chapter to stdout for quick reference.
 
-elif (( numberedLines )); then
+ * `--man`  
+   Displays this manual page, which is a helpful alternative to using `man`,  
+   if the manual page isn't installed.
 
-  [[ -n $(command -v seq) ]] || die "Required utility \`seq\` not found."
-
-  # Determine the format string.
-  txt=$*
-  txt=${txt:-$kDEFAULT_NUMBERED_LINES_FORMAT}
-
-  cmdArgs=( seq -f "$txt" $count )
-
-  if (( countOnly )); then
-    if (( ! countIsTotalSize )); then
-      # !! If only a line count was given, we must actually execute the 
-      # !! command to see how many bytes it results in.
-      count=$(( $("${cmdArgs[@]}" | wc -c) )) # the extra $(( ... )) is to trim the leading whitespace that BSD wc outputs.
-      (( ${PIPESTATUS[0]} == 0 )) || die
-    fi
-    echo "$count"
-    exit 0
-  fi
-
-  if (( countIsTotalSize )); then
-    "${cmdArgs[@]}" | head -c $count
-    # Make sure that head succeeded, and that seq either reported success
-    # or 141 (128 + 13 (SIGPIPE)), which happens when head exits after having
-    # received enough data.
-    (( $? == 0 && (${PIPESTATUS[0]} == 0 || ${PIPESTATUS[0]} == 141) )) || die
-  else
-    "${cmdArgs[@]}" || die
-  fi
-
-else # specified text
+ * `--version`  
+   Prints version information.
   
-  # Determine the text to repeat
-  if (( $# == 0 )); then # read from stdin - all input at once.
-    IFS= read -d $'\x4' -r txt
-  else # all remaining operands (though typically only 1)
-    txt=$*
-  fi
+ * `--home`  
+   Opens this utility's home page in the system's default web browser.
 
-  # Apply per-line repeat count, if specified
-  if (( lineBasedOutput )); then
-    case $perLineRepeatCount in
-      0)
-        txt=
-        ;;
-      1)
-        : # nothing more to do
-        ;;
-      *)
-        txt=$(repeat -- $perLineRepeatCount "$txt")
-        ;;
-    esac
-    txt+=$'\n'
-  fi
+## COMPATIBILITY
 
-  txtLenInBytes=$(printf '%b' "$txt" | wc -c) # Note the use of %b to ensure that escape sequences in $txt are expanded.
+Requires Perl v??? or higher.
 
-  # DRY RUN: only print the total count of bytes that *would* be generated and exit.
-  if (( countOnly )); then
-    if (( countIsTotalSize )); then
-      echo "$count"
-    else
-      echo "$(( count * txtLenInBytes ))"
-    fi
-    exit 0
-  fi
+## LICENSE
 
-  # Invoke the implementing function - choose the most efficient one:
-
-  if (( txtLenInBytes == 1 )); then # SINGLE BYTE to repeat - for speed, use **Perl**, if available, else **dd**.
-  
-    repeat_singleByte $count "$txt" || die
-  
-  else # MORE THAN 1 BYTE/CHAR TO REPEAT AND/OR A SEPARATOR WAS SPECIFIED -> use **Perl**, if available, else **awk**.
-
-    # If the total byte count was specified, calculate how many repeats are needed, plus the rest.
-    remainingBytes=''
-    if (( countIsTotalSize )); then
-      totalCount=$count
-      count=$(( totalCount / txtLenInBytes ))
-      remainingByteCount=$(( totalCount % txtLenInBytes ))
-      # Determine the remaining text chunk needed to achieve the exact total byte count.
-      if (( remainingByteCount > 0 )); then
-         # !! Achieving the *exact* overall byte count is important, so we slice off the required number of *bytes*, 
-         # !! even though that can result in a multibyte char. at the very end getting broken apart, resulting
-         # !! in an illegal character.
-         # !! Figuring out if and when that happens would be nontrivial.
-         # !! Since we need to lop off *bytes*, we must switch to the "C" locale (in a subshell) first.)
-        remainingBytes=$(LC_ALL=C; printf %s "${txt:0:remainingByteCount}")
-      fi
-    fi
-
-    (( count > 0 )) && repeat -- $count "$txt"
-    [[ -n $remainingBytes ]] && printf "$remainingBytes"
-
-  fi
-
-fi
+For license information, bug reports, and more, visit the home page by running  
+`rpt --home`
